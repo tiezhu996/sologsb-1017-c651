@@ -1,22 +1,58 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { sampleScript } from './sample'
-import type { Character, ContinuityState, DiffItem, Prop, Reply, Scene, Script, Version, Wardrobe, WarningItem, WarningReview } from './types'
+import {
+  applyEntryToRecord,
+  classifyEntry,
+  createPackageFromScript,
+  newId,
+  parsePackageFile
+} from './packageLogic'
+import type {
+  ArbitrationRecord,
+  Character,
+  ContinuityState,
+  DiffItem,
+  PackageSceneEntry,
+  Prop,
+  Reply,
+  Scene,
+  Script,
+  ShootPackage,
+  ShootSceneRecord,
+  Version,
+  Wardrobe,
+  WarningItem,
+  WarningReview
+} from './types'
 
 const STORAGE_KEY = 'sologsb-1017-continuity-v1'
 const clone = <T,>(value: T): T => structuredClone(value)
 const id = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 
+function withDefaults(raw: Partial<ContinuityState> | null): ContinuityState | null {
+  if (!raw || !raw.script?.scenes?.length) return null
+  return {
+    script: raw.script,
+    reviews: raw.reviews ?? {},
+    versions: raw.versions ?? [],
+    packages: raw.packages ?? [],
+    sceneRecords: raw.sceneRecords ?? {},
+    arbitrations: raw.arbitrations ?? [],
+    updatedAt: raw.updatedAt ?? new Date().toISOString()
+  }
+}
+
 function initialState(): ContinuityState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (raw) {
-      const parsed = JSON.parse(raw) as ContinuityState
-      if (parsed.script?.scenes?.length) return parsed
+      const migrated = withDefaults(JSON.parse(raw) as Partial<ContinuityState>)
+      if (migrated) return migrated
     }
   } catch {
     // Ignore an invalid local draft and restore the bundled example.
   }
-  return { script: clone(sampleScript), reviews: {}, versions: [], updatedAt: new Date().toISOString() }
+  return { script: clone(sampleScript), reviews: {}, versions: [], packages: [], sceneRecords: {}, arbitrations: [], updatedAt: new Date().toISOString() }
 }
 
 export function deriveWarnings(script: Script): WarningItem[] {
@@ -124,7 +160,7 @@ export function diffScript(base: Script, current: Script): DiffItem[] {
     fields.forEach(({ key, label }) => {
       const before = String(previous[key] ?? '')
       const after = String(scene[key] ?? '')
-      if (before !== after) result.push({ id: `${scene.id}-${String(key)}`, sceneNumber: scene.number, field: label, before, after })
+      if (before !== after) result.push({ id: `${scene.id}-${String(key)}`, field: label, sceneNumber: scene.number, before, after })
     })
   })
   base.scenes.forEach((scene) => {
@@ -134,6 +170,14 @@ export function diffScript(base: Script, current: Script): DiffItem[] {
   })
   return result
 }
+
+export interface PublishResult {
+  ok: boolean
+  error?: string
+  applied?: number
+}
+
+export type ContinuityStore = ReturnType<typeof useContinuityStore>
 
 export function useContinuityStore() {
   const [state, setState] = useState<ContinuityState>(initialState)
@@ -152,6 +196,7 @@ export function useContinuityStore() {
     return () => window.clearTimeout(saveTimer.current)
   }, [state])
 
+  /* mutate 只服务剧本工作稿；现场包/裁决/现场记录走独立状态，不进剧本撤销栈 */
   const mutate = useCallback((mutator: (script: Script) => void) => {
     setState((previous) => {
       const next = clone(previous.script)
@@ -160,6 +205,17 @@ export function useContinuityStore() {
       if (undoRef.current.length > 80) undoRef.current.shift()
       redoRef.current = []
       return { ...previous, script: next, updatedAt: new Date().toISOString() }
+    })
+  }, [])
+
+  const mutatePackages = useCallback((mutator: (draft: { packages: ShootPackage[]; sceneRecords: Record<string, ShootSceneRecord>; arbitrations: ArbitrationRecord[] }) => void) => {
+    setState((previous) => {
+      const packages = clone(previous.packages)
+      const sceneRecords = clone(previous.sceneRecords)
+      const arbitrations = clone(previous.arbitrations)
+      mutator({ packages, sceneRecords, arbitrations })
+      packages.forEach((pkg) => { pkg.updatedAt = new Date().toISOString() })
+      return { ...previous, packages, sceneRecords, arbitrations, updatedAt: new Date().toISOString() }
     })
   }, [])
 
@@ -186,6 +242,8 @@ export function useContinuityStore() {
   }, [mutate])
 
   const updateScene = useCallback((sceneId: string, field: keyof Scene, value: Scene[keyof Scene]) => {
+    // 锁定只能通过 lockScene（含待裁决门禁）；普通字段编辑在 UI 层对锁定场禁用。
+    if (field === 'status' && value === 'locked') return
     mutate((script) => {
       const scene = script.scenes.find((item) => item.id === sceneId)
       if (scene) (scene as unknown as Record<string, unknown>)[field] = value
@@ -320,8 +378,229 @@ export function useContinuityStore() {
 
   const reset = useCallback(() => {
     mutate((script) => { Object.assign(script, clone(sampleScript)) })
-    setState((previous) => ({ ...previous, reviews: {} }))
+    setState((previous) => ({ ...previous, reviews: {}, packages: [], sceneRecords: {}, arbitrations: [] }))
   }, [mutate])
+
+  /* ============ 现场交接包（独立状态所有权） ============ */
+
+  const createHandoverPackage = useCallback((name: string, shootDay: string) => {
+    const pkg = createPackageFromScript(state.script, name, shootDay)
+    setState((previous) => ({ ...previous, packages: [pkg, ...previous.packages] }))
+    return pkg
+  }, [state.script])
+
+  const updatePackageEntry = useCallback((packageId: string, entryId: string, patch: Partial<PackageSceneEntry>) => {
+    mutatePackages(({ packages }) => {
+      const pkg = packages.find((item) => item.id === packageId)
+      const entry = pkg?.entries.find((item) => item.id === entryId)
+      if (entry) Object.assign(entry, patch)
+    })
+  }, [mutatePackages])
+
+  const toggleEntryReference = useCallback((packageId: string, entryId: string, kind: 'character' | 'prop', refId: string, refName: string) => {
+    mutatePackages(({ packages }) => {
+      const entry = packages.find((item) => item.id === packageId)?.entries.find((item) => item.id === entryId)
+      if (!entry) return
+      if (kind === 'character') {
+        const exists = entry.characterIds.includes(refId)
+        entry.characterIds = exists ? entry.characterIds.filter((value) => value !== refId) : [...entry.characterIds, refId]
+        entry.characterNames = exists ? entry.characterNames.filter((value) => value !== refName) : [...entry.characterNames.filter((value) => value !== refName), refName]
+        if (exists) entry.costumeChanges = entry.costumeChanges.filter((change) => change.characterId !== refId)
+      } else {
+        const exists = entry.propIds.includes(refId)
+        entry.propIds = exists ? entry.propIds.filter((value) => value !== refId) : [...entry.propIds, refId]
+        entry.propNames = exists ? entry.propNames.filter((value) => value !== refName) : [...entry.propNames.filter((value) => value !== refName), refName]
+      }
+    })
+  }, [mutatePackages])
+
+  const setEntryCostume = useCallback((packageId: string, entryId: string, characterId: string, wardrobeId: string) => {
+    mutatePackages(({ packages }) => {
+      const entry = packages.find((item) => item.id === packageId)?.entries.find((item) => item.id === entryId)
+      if (!entry) return
+      entry.costumeChanges = entry.costumeChanges.filter((change) => change.characterId !== characterId)
+      if (wardrobeId) {
+        const wardrobe = state.script.wardrobes.find((item) => item.id === wardrobeId)
+        const character = state.script.characters.find((item) => item.id === characterId)
+        if (wardrobe && character) {
+          entry.costumeChanges.push({ characterId, characterName: character.name, wardrobeId, wardrobeName: wardrobe.name, note: '' })
+        }
+      }
+    })
+  }, [mutatePackages, state.script.wardrobes, state.script.characters])
+
+  /** 导入：按场次编号 + 修订色归位；不一致/拆分/缺号 → 待裁决区，本地正文原样保留。 */
+  const importHandoverPackage = useCallback((raw: string): { imported: number; matched: number; conflicts: number } => {
+    const incoming = parsePackageFile(raw)
+    let matched = 0
+    let conflicts = 0
+    setState((previous) => {
+      const script = previous.script
+      const packages = clone(previous.packages).filter((pkg) => pkg.id !== incoming.id)
+      const pkg = clone(incoming)
+      // 重新导入视为新一轮交接：清掉发布态，但保留为新尝试
+      if (pkg.status === 'published') pkg.status = 'ready'
+      pkg.checkpoint = undefined
+      pkg.lastError = undefined
+      packages.unshift(pkg)
+
+      const keptArbitrations = previous.arbitrations.filter((record) => record.packageId !== pkg.id)
+      const freshArbitrations: ArbitrationRecord[] = []
+      pkg.entries.forEach((entry) => {
+        const result = classifyEntry(entry, script)
+        if (result.kind === 'match') {
+          matched += 1
+          return
+        }
+        conflicts += 1
+        const prior = previous.arbitrations.find(
+          (record) => record.packageId === pkg.id && record.entryId === entry.id && record.reason === result.reason
+        )
+        // 同一条记录、同一原因且已裁决，保留作者/审阅人的裁决结论；否则重新挂起
+        if (prior && prior.status !== 'pending') freshArbitrations.push(prior)
+        else {
+          freshArbitrations.push({
+            id: id('arb'),
+            packageId: pkg.id,
+            entryId: entry.id,
+            reason: result.reason,
+            detail: result.detail,
+            status: 'pending',
+            createdAt: new Date().toISOString()
+          })
+        }
+      })
+
+      return {
+        ...previous,
+        packages,
+        arbitrations: [...freshArbitrations, ...keptArbitrations],
+        updatedAt: new Date().toISOString()
+      }
+    })
+    return { imported: incoming.entries.length, matched, conflicts }
+  }, [])
+
+  const resolveArbitration = useCallback((arbitrationId: string, decision: 'accepted' | 'rejected', sceneId?: string) => {
+    mutatePackages(({ arbitrations }) => {
+      const record = arbitrations.find((item) => item.id === arbitrationId)
+      if (!record) return
+      record.status = decision
+      record.resolvedAt = new Date().toISOString()
+      record.resolutionSceneId = decision === 'accepted' ? sceneId : undefined
+    })
+  }, [mutatePackages])
+
+  /**
+   * 发布：事务式写入现场记录。
+   * - 写入前留存检查点（上一包状态 + 受影响场次的旧记录）；
+   * - 失败时回滚，已发布的上一包和检查点都保留；
+   * - 重试按 packageId+entryId 幂等覆盖，绝不重复追加；
+   * - 该包存在未裁决记录时拒绝发布。
+   */
+  const publishPackage = useCallback((packageId: string, simulateFailure = false): PublishResult => {
+    const pkg = state.packages.find((item) => item.id === packageId)
+    if (!pkg) return { ok: false, error: '交接包不存在。' }
+    const pending = state.arbitrations.filter((record) => record.packageId === packageId && record.status === 'pending')
+    if (pending.length) return { ok: false, error: `还有 ${pending.length} 条未裁决记录，归位完成前不能发布。` }
+
+    const targets = new Map<string, Scene>()
+    for (const entry of pkg.entries) {
+      const record = state.arbitrations.find((item) => item.packageId === packageId && item.entryId === entry.id)
+      if (record?.status === 'rejected') continue
+      let scene: Scene | undefined
+      if (record?.status === 'accepted' && record.resolutionSceneId) {
+        scene = state.script.scenes.find((item) => item.id === record.resolutionSceneId)
+      } else {
+        const result = classifyEntry(entry, state.script)
+        if (result.kind === 'match') scene = state.script.scenes.find((item) => item.id === result.sceneId)
+      }
+      if (!scene) return { ok: false, error: `场次 ${entry.sceneNumber} 仍无明确归位，请先在待裁决区处理。` }
+      targets.set(entry.id, scene)
+    }
+
+    const targetSceneIds = [...new Set([...targets.values()].map((scene) => scene.id))]
+    const recordsBefore: Record<string, ShootSceneRecord> = {}
+    targetSceneIds.forEach((sceneId) => {
+      if (state.sceneRecords[sceneId]) recordsBefore[sceneId] = clone(state.sceneRecords[sceneId])
+    })
+    const checkpoint = {
+      attemptAt: new Date().toISOString(),
+      packageSnapshot: clone(pkg),
+      sceneIds: targetSceneIds,
+      recordsBefore
+    }
+
+    // 模拟断网：检查点留下，状态与现场记录全部保持发布前。
+    if (simulateFailure) {
+      setState((previous) => ({
+        ...previous,
+        packages: previous.packages.map((item) => item.id === packageId
+          ? { ...item, status: 'failed', lastError: '网络中断：发布未送达，已保留上一包与检查点，可安全重试。', checkpoint }
+          : item),
+        updatedAt: new Date().toISOString()
+      }))
+      return { ok: false, error: '网络中断：发布未送达，已保留上一包与检查点，可安全重试。' }
+    }
+
+    let sceneRecords = clone(state.sceneRecords)
+    const appliedEntries: Array<{ entryId: string; sceneId: string }> = []
+    pkg.entries.forEach((entry) => {
+      const scene = targets.get(entry.id)
+      if (!scene) return
+      sceneRecords = applyEntryToRecord(sceneRecords, entry, scene, state.script, packageId)
+      appliedEntries.push({ entryId: entry.id, sceneId: scene.id })
+    })
+
+    setState((previous) => ({
+      ...previous,
+      sceneRecords,
+      packages: previous.packages.map((item) => {
+        if (item.id !== packageId) return item
+        const entries = item.entries.map((entry) => {
+          const applied = appliedEntries.find((appliedEntry) => appliedEntry.entryId === entry.id)
+          return applied ? { ...entry, appliedSceneId: applied.sceneId, appliedAt: new Date().toISOString() } : entry
+        })
+        return { ...item, entries, status: 'published', publishedAt: new Date().toISOString(), lastError: undefined, checkpoint: undefined }
+      }),
+      updatedAt: new Date().toISOString()
+    }))
+    return { ok: true, applied: appliedEntries.length }
+  }, [state.packages, state.arbitrations, state.sceneRecords, state.script])
+
+  /** 按检查点回滚失败的发布：恢复受影响场次的旧记录，包回到待发布。 */
+  const rollbackPackage = useCallback((packageId: string) => {
+    setState((previous) => {
+      const pkg = previous.packages.find((item) => item.id === packageId)
+      if (!pkg?.checkpoint) return previous
+      const snapshot = pkg.checkpoint.packageSnapshot
+      const sceneRecords = clone(previous.sceneRecords)
+      const checkpoint = pkg.checkpoint
+      checkpoint.sceneIds.forEach((sceneId) => {
+        const before = checkpoint.recordsBefore[sceneId]
+        if (before) sceneRecords[sceneId] = clone(before)
+        else delete sceneRecords[sceneId]
+      })
+      return {
+        ...previous,
+        sceneRecords,
+        packages: previous.packages.map((item) => item.id === packageId
+          ? { ...clone(snapshot), status: 'ready', lastError: undefined }
+          : item)
+      }
+    })
+  }, [])
+
+  /** 锁定门禁：存在任何未裁决记录时，场次一律不能锁定。 */
+  const lockScene = useCallback((sceneId: string): { ok: boolean; pendingCount: number } => {
+    const pendingCount = state.arbitrations.filter((record) => record.status === 'pending').length
+    if (pendingCount > 0) return { ok: false, pendingCount }
+    mutate((script) => {
+      const scene = script.scenes.find((item) => item.id === sceneId)
+      if (scene) scene.status = 'locked'
+    })
+    return { ok: true, pendingCount: 0 }
+  }, [mutate, state.arbitrations])
 
   return {
     state,
@@ -346,6 +625,15 @@ export function useContinuityStore() {
     restoreVersion,
     undo,
     redo,
-    reset
+    reset,
+    createHandoverPackage,
+    updatePackageEntry,
+    toggleEntryReference,
+    setEntryCostume,
+    importHandoverPackage,
+    resolveArbitration,
+    publishPackage,
+    rollbackPackage,
+    lockScene
   }
 }

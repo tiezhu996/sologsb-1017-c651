@@ -89,6 +89,21 @@ mark { padding: 0 .1em; color: #3a2414; background: #f1d486; border-radius: 2px;
 .library-card { display: grid; gap: 12px; padding: 15px; border: 1px solid #ddd3c5 !important; border-radius: 11px !important; }
 .timeline-card { grid-template-columns: minmax(150px, 1.2fr) 1fr 120px auto; align-items: center; }
 .shortcut-grid { display: grid; grid-template-columns: 160px 1fr; gap: 12px; align-items: center; }
+
+/* 现场交接包 */
+.handover-layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 16px; align-items: start; }
+.handover-detail { min-width: 0; }
+.package-entry { display: grid; gap: 14px; }
+.package-entry.has-conflict { border-left: 4px solid #c77a22 !important; background: #fffaf2; }
+.package-fields { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 12px; align-items: start; }
+.package-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.package-costumes { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; padding-top: 14px; border-top: 1px dashed #e0d8cb; }
+.record-hint { display: block; padding-top: 10px; border-top: 1px dashed #e0d8cb; }
+.arbitration-panel { border-left: 4px solid #c77a22 !important; background: #fffaf2; }
+.arbitration-item.status-rejected { opacity: .65; }
+.arbitration-item.status-accepted { background: #f6faf5; border-radius: 8px; padding: 8px; }
+.shoot-record-paper { background: #f7f4ed !important; }
+.shoot-record-grid { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 kbd { padding: 5px 8px; color: #fdf9f1; border-radius: 5px; background: #44382e; font: 600 12px/1.2 ui-monospace, monospace; }
 @media (max-width: 1050px) {
   .toolbar { flex-wrap: wrap; padding-top: 12px; padding-bottom: 12px; }
@@ -103,7 +118,8 @@ kbd { padding: 5px 8px; color: #fdf9f1; border-radius: 5px; background: #44382e;
   .main-content { width: calc(100% - 20px); padding-top: 22px; }
   .scene-number { width: auto; }
   .outline-card { grid-template-columns: 52px 1fr; }
-  .form-grid, .relation-grid, .version-layout { grid-template-columns: 1fr; }
+  .form-grid, .relation-grid, .version-layout, .handover-layout { grid-template-columns: 1fr; }
+  .package-fields, .package-facts { grid-template-columns: 1fr; }
   .form-grid .span-2 { grid-column: auto; }
   .form-grid > .MuiBox-root, .relation-grid > .MuiBox-root { grid-column: 1; }
   .editor-paper { padding: 16px; }

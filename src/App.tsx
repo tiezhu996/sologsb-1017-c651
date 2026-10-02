@@ -33,6 +33,9 @@ import {
   Block,
   CheckCircle,
   Close,
+  Gavel,
+  Lock,
+  LockOpen,
   Storage,
   Difference,
   Keyboard,
@@ -46,6 +49,7 @@ import {
   WarningAmber
 } from '@mui/icons-material'
 import { diffScript, useContinuityStore } from './store'
+import { HandoverView } from './HandoverView'
 import type { RevisionColor, Scene, WarningItem, WarningStatus } from './types'
 
 const revisionOptions: Array<{ value: RevisionColor; label: string; color: string }> = [
@@ -106,7 +110,7 @@ export default function App() {
   const store = useContinuityStore()
   const { state, warnings } = store
   const [selectedSceneId, setSelectedSceneId] = useState(state.script.scenes[0]?.id ?? '')
-  const [view, setView] = useState<'outline' | 'detail' | 'warnings' | 'versions'>('outline')
+  const [view, setView] = useState<'outline' | 'detail' | 'warnings' | 'handover' | 'versions'>('outline')
   const [query, setQuery] = useState('')
   const [libraryOpen, setLibraryOpen] = useState(false)
   const [libraryTab, setLibraryTab] = useState('characters')
@@ -116,10 +120,13 @@ export default function App() {
   const [warningFilter, setWarningFilter] = useState<'all' | WarningStatus>('all')
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({})
   const [shortcutOpen, setShortcutOpen] = useState(false)
+  const [lockNotice, setLockNotice] = useState<string | null>(null)
   const searchRef = useRef<HTMLInputElement>(null)
 
   const selectedScene = state.script.scenes.find((scene) => scene.id === selectedSceneId) ?? state.script.scenes[0]
   const pendingWarnings = warnings.filter((warning) => (state.reviews[warning.id]?.status ?? 'pending') === 'pending')
+  const pendingArbitrations = state.arbitrations.filter((record) => record.status === 'pending')
+  const sceneRecord = selectedScene ? state.sceneRecords[selectedScene.id] : undefined
   const visibleWarnings = warnings.filter((warning) => warningFilter === 'all' || (state.reviews[warning.id]?.status ?? 'pending') === warningFilter)
   const selectedVersion = state.versions.find((version) => version.id === selectedVersionId) ?? state.versions[0]
   const diff = useMemo(() => selectedVersion ? diffScript(selectedVersion.script, state.script) : [], [selectedVersion, state.script])
@@ -222,7 +229,23 @@ export default function App() {
               <Chip label={`${sceneWarnings.length} 条检查`} color={sceneWarnings.length ? 'warning' : 'success'} size="small" />
               <Chip label={`${selectedScene.pageLength.toFixed(2)} 页`} size="small" variant="outlined" />
               <Chip label={selectedScene.storyTime} size="small" variant="outlined" />
-              {locked && <Chip icon={<Block />} label="场景已锁定" size="small" />}
+              {locked ? (
+                <Chip icon={<Block />} label="场景已锁定" size="small" color="default" />
+              ) : (
+                <Button
+                  size="small"
+                  variant="outlined"
+                  color={pendingArbitrations.length ? 'warning' : 'success'}
+                  startIcon={<Lock />}
+                  onClick={() => {
+                    const result = store.lockScene(selectedScene.id)
+                    if (!result.ok) setLockNotice(`存在 ${result.pendingCount} 条未裁决的导入记录，场次不能锁定；请先到“现场交接”处理待裁决区。`)
+                  }}
+                >
+                  锁定场次{pendingArbitrations.length ? `（${pendingArbitrations.length} 条待裁）` : ''}
+                </Button>
+              )}
+              {locked && <Button size="small" startIcon={<LockOpen />} onClick={() => store.updateScene(selectedScene.id, 'status', 'review')}>解锁</Button>}
             </Stack>
           </Box>
           <Stack direction="row" gap={1} flexWrap="wrap">
@@ -231,6 +254,14 @@ export default function App() {
             <Button color="error" onClick={() => { store.deleteScene(selectedScene.id); setView('outline') }}>删除</Button>
           </Stack>
         </Stack>
+
+        {lockNotice && <Alert severity="warning" sx={{ mt: 2 }} onClose={() => setLockNotice(null)}>{lockNotice}</Alert>}
+
+        {pendingArbitrations.length > 0 && (
+          <Alert severity="warning" icon={<Gavel />} sx={{ mt: 2 }} action={<Button size="small" onClick={() => setView('handover')}>去裁决</Button>}>
+            有 {pendingArbitrations.length} 条导入记录未裁决，按规则所有场次暂不能锁定。
+          </Alert>
+        )}
 
         {sceneWarnings.length > 0 && (
           <Alert severity="warning" icon={<WarningAmber />} sx={{ mt: 2 }}>
@@ -252,10 +283,10 @@ export default function App() {
             </TextField>
             <TextField label="故事时间" value={selectedScene.storyTime} disabled={locked} onChange={(event) => store.updateScene(selectedScene.id, 'storyTime', event.target.value)} />
             <TextField type="number" label="页数" value={selectedScene.pageLength} disabled={locked} inputProps={{ step: 0.25, min: 0 }} onChange={(event) => store.updateScene(selectedScene.id, 'pageLength', Number(event.target.value))} />
-            <TextField select label="场次状态" value={selectedScene.status} disabled={locked} onChange={(event) => store.updateScene(selectedScene.id, 'status', event.target.value as Scene['status'])}>
+            <TextField select label="场次状态（锁定走专用按钮）" value={locked ? 'locked' : selectedScene.status} disabled={locked} onChange={(event) => store.updateScene(selectedScene.id, 'status', event.target.value as Scene['status'])}>
               <MenuItem value="draft">草稿</MenuItem>
               <MenuItem value="review">待审</MenuItem>
-              <MenuItem value="locked">锁定</MenuItem>
+              <MenuItem value="locked" disabled>锁定（有未裁决记录时禁用）</MenuItem>
             </TextField>
             <TextField select label="修订颜色" value={selectedScene.revision} disabled={locked} onChange={(event) => store.updateScene(selectedScene.id, 'revision', event.target.value as RevisionColor)}>
               {revisionOptions.map((option) => <MenuItem key={option.value} value={option.value}><span className={`revision-swatch revision-${option.value}`} />{option.label}</MenuItem>)}
@@ -319,6 +350,32 @@ export default function App() {
                 )
               })}
             </Box>
+          )}
+        </Paper>
+
+        <Paper className="editor-paper shoot-record-paper" elevation={0}>
+          <Stack direction="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" gap={1}>
+            <Box>
+              <Typography variant="h6">现场记录（交接包写入）</Typography>
+              <Typography variant="body2" color="text.secondary">
+                这些字段属于现场交接状态，发布后按场次归位；正文（场名、摘要等）与修订色不在此修改。
+              </Typography>
+            </Box>
+            <Button size="small" onClick={() => setView('handover')}>前往现场交接</Button>
+          </Stack>
+          {sceneRecord ? (
+            <Box className="shoot-record-grid" mt={2}>
+              <Chip size="small" label={`拍摄日：${sceneRecord.shootDate}`} />
+              <Chip size="small" variant="outlined" label={`出场：${sceneRecord.characterIds.map((cid) => state.script.characters.find((c) => c.id === cid)?.name ?? '').filter(Boolean).join('、') || '—'}`} />
+              <Chip size="small" variant="outlined" label={`道具：${sceneRecord.propIds.map((pid) => state.script.props.find((p) => p.id === pid)?.name ?? '').filter(Boolean).join('、') || '—'}`} />
+              {sceneRecord.costumeChanges.map((change) => (
+                <Chip key={`${change.characterId}-${change.wardrobeId}`} size="small" color="secondary" variant="outlined" label={`换装：${change.characterName} → ${change.wardrobeName}`} />
+              ))}
+              {sceneRecord.note && <Typography variant="body2" mt={1}>现场备注：{sceneRecord.note}</Typography>}
+              <Typography variant="caption" color="text.secondary">写入时间：{new Date(sceneRecord.appliedAt).toLocaleString('zh-CN')}</Typography>
+            </Box>
+          ) : (
+            <Typography variant="body2" color="text.secondary" mt={1.5}>本场还没有已发布的现场记录。</Typography>
           )}
         </Paper>
       </Box>
@@ -501,6 +558,8 @@ export default function App() {
         <span>{store.saveStatus === 'saved' ? '● 已保存到本机' : '◌ 正在保存'}</span>
         <span>{state.script.scenes.length} 场 / {state.script.scenes.reduce((total, scene) => total + scene.pageLength, 0).toFixed(2)} 页</span>
         <span className={pendingWarnings.length ? 'attention' : ''}>{pendingWarnings.length} 条问题待审</span>
+        <span className={pendingArbitrations.length ? 'attention' : ''}>{pendingArbitrations.length} 条导入待裁决{pendingArbitrations.length ? ' · 场次锁定已挂起' : ''}</span>
+        <span>{state.packages.filter((pkg) => pkg.status === 'published').length} 个交接包已发布</span>
         <span>所有修改自动保存在浏览器本地</span>
       </Box>
 
@@ -526,6 +585,7 @@ export default function App() {
         <Tab value="outline" label="大纲视图" />
         <Tab value="detail" label="场景详情" />
         <Tab value="warnings" label={<Badge badgeContent={pendingWarnings.length} color="warning"><span className="tab-label">警告审阅</span></Badge>} />
+        <Tab value="handover" label={<Badge badgeContent={pendingArbitrations.length} color="warning"><span className="tab-label">现场交接</span></Badge>} />
         <Tab value="versions" label={<Badge badgeContent={state.versions.length} color="secondary"><span className="tab-label">版本差异</span></Badge>} />
       </Tabs>
 
@@ -550,6 +610,7 @@ export default function App() {
         {view === 'outline' && renderOutline()}
         {view === 'detail' && renderSceneDetail()}
         {view === 'warnings' && renderWarnings()}
+        {view === 'handover' && <HandoverView store={store} openScene={openScene} />}
         {view === 'versions' && renderVersions()}
       </Box>
 
