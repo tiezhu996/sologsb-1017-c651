@@ -1,22 +1,113 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { sampleScript } from './sample'
-import type { Character, ContinuityState, DiffItem, Prop, Reply, Scene, Script, Version, Wardrobe, WarningItem, WarningReview } from './types'
+import { packageRequestHash, planImport } from './handoff'
+import { publishPackage } from './transport'
+import type {
+  ArbitrationRecord,
+  AttachedHandoff,
+  Character,
+  ContinuityState,
+  DiffItem,
+  HandoffEntry,
+  HandoffPackage,
+  HandoffState,
+  Prop,
+  Reply,
+  Scene,
+  Script,
+  Version,
+  Wardrobe,
+  WardrobeChange,
+  WarningItem,
+  WarningReview
+} from './types'
 
-const STORAGE_KEY = 'sologsb-1017-continuity-v1'
+const STORAGE_KEY = 'sologsb-1017-continuity-v2'
+const LEGACY_KEY = 'sologsb-1017-continuity-v1'
 const clone = <T,>(value: T): T => structuredClone(value)
 const id = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 
-function initialState(): ContinuityState {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw) as ContinuityState
-      if (parsed.script?.scenes?.length) return parsed
-    }
-  } catch {
-    // Ignore an invalid local draft and restore the bundled example.
+/* ---------------- 现场交接包种子（与本地剧本稿所有权分离） ---------------- */
+
+function change(characterId: string, wardrobeId: string, note = ''): WardrobeChange {
+  return { id: id('wc'), characterId, wardrobeId, note }
+}
+
+function defaultHandoff(): HandoffState {
+  const draft: HandoffPackage = {
+    id: 'pkg-draft',
+    name: '现场交接包 · 拍摄日 D1',
+    preparedAt: '2026-10-01T07:30:00.000Z',
+    entries: [
+      {
+        id: 'entry-d1',
+        sceneNumber: '1',
+        revision: 'white',
+        shootDate: '2026-10-01',
+        characterIds: ['char-lin', 'char-su'],
+        propIds: ['prop-recorder'],
+        wardrobeChanges: [change('char-lin', 'ward-lin-jacket', '雨大，夹克外补穿黑色雨衣')],
+        notes: '苏遥录音包改用左肩，现场雨势比剧本预期大。'
+      },
+      {
+        id: 'entry-d2',
+        sceneNumber: '3',
+        revision: 'blue', // 本地第 3 场是粉色：导入进待裁决，保留本地修订色
+        shootDate: '2026-10-01',
+        characterIds: ['char-lin', 'char-su'],
+        propIds: ['prop-ticket', 'prop-recorder'],
+        wardrobeChanges: [],
+        notes: '现场持蓝色通告单拍摄，与作者稿粉色页不一致，待作者确认。'
+      },
+      {
+        id: 'entry-d4a',
+        sceneNumber: '5', // 本地无第 5 场：待裁决
+        revision: 'green',
+        shootDate: '2026-10-01',
+        characterIds: ['char-qiao'],
+        propIds: ['prop-key'],
+        wardrobeChanges: [change('char-qiao', 'ward-qiao-raincoat', '雨衣内侧加毛巾，防穿帮')],
+        notes: '补拍灯塔交接，通告标注为拆分后的 5A。'
+      }
+    ]
   }
-  return { script: clone(sampleScript), reviews: {}, versions: [], updatedAt: new Date().toISOString() }
+  return {
+    draft,
+    packages: [],
+    lastPublishedPackage: null,
+    publish: { phase: 'idle' },
+    log: [],
+    checkpoints: [],
+    attached: {},
+    arbitration: [],
+    importedEntryIds: []
+  }
+}
+
+function migrateState(parsed: Partial<ContinuityState> & { script?: Script }): ContinuityState | null {
+  if (!parsed.script?.scenes?.length) return null
+  return {
+    script: parsed.script,
+    reviews: parsed.reviews ?? {},
+    versions: parsed.versions ?? [],
+    handoff: parsed.handoff ? { ...defaultHandoff(), ...parsed.handoff } : defaultHandoff(),
+    updatedAt: parsed.updatedAt ?? new Date().toISOString()
+  }
+}
+
+function initialState(): ContinuityState {
+  for (const key of [STORAGE_KEY, LEGACY_KEY]) {
+    try {
+      const raw = localStorage.getItem(key)
+      if (raw) {
+        const migrated = migrateState(JSON.parse(raw) as Partial<ContinuityState>)
+        if (migrated) return migrated
+      }
+    } catch {
+      // Ignore an invalid local draft and keep looking / restore the bundled example.
+    }
+  }
+  return { script: clone(sampleScript), reviews: {}, versions: [], handoff: defaultHandoff(), updatedAt: new Date().toISOString() }
 }
 
 export function deriveWarnings(script: Script): WarningItem[] {
@@ -135,12 +226,20 @@ export function diffScript(base: Script, current: Script): DiffItem[] {
   return result
 }
 
+export interface ImportSummary {
+  attached: number
+  conflicts: number
+  skipped: number
+}
+
 export function useContinuityStore() {
   const [state, setState] = useState<ContinuityState>(initialState)
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving'>('saved')
   const undoRef = useRef<Script[]>([])
   const redoRef = useRef<Script[]>([])
   const saveTimer = useRef<number | undefined>(undefined)
+  const stateRef = useRef(state)
+  stateRef.current = state
 
   useEffect(() => {
     setSaveStatus('saving')
@@ -160,6 +259,14 @@ export function useContinuityStore() {
       if (undoRef.current.length > 80) undoRef.current.shift()
       redoRef.current = []
       return { ...previous, script: next, updatedAt: new Date().toISOString() }
+    })
+  }, [])
+
+  const mutateHandoff = useCallback((mutator: (handoff: HandoffState) => void) => {
+    setState((previous) => {
+      const next = clone(previous.handoff)
+      mutator(next)
+      return { ...previous, handoff: next, updatedAt: new Date().toISOString() }
     })
   }, [])
 
@@ -191,6 +298,14 @@ export function useContinuityStore() {
       if (scene) (scene as unknown as Record<string, unknown>)[field] = value
     })
   }, [mutate])
+
+  /* 锁定闸门：存在未裁决记录时，任何场次都不能锁定。 */
+  const setSceneStatus = useCallback((sceneId: string, status: Scene['status']): boolean => {
+    const pending = stateRef.current.handoff.arbitration.filter((item) => item.status === 'pending')
+    if (status === 'locked' && pending.length > 0) return false
+    updateScene(sceneId, 'status', status)
+    return true
+  }, [updateScene])
 
   const toggleSceneRelation = useCallback((sceneId: string, field: 'characterIds' | 'propIds', itemId: string) => {
     mutate((script) => {
@@ -320,8 +435,265 @@ export function useContinuityStore() {
 
   const reset = useCallback(() => {
     mutate((script) => { Object.assign(script, clone(sampleScript)) })
-    setState((previous) => ({ ...previous, reviews: {} }))
+    setState((previous) => ({ ...previous, reviews: {}, handoff: defaultHandoff() }))
   }, [mutate])
+
+  /* ---------------- 现场交接包：草稿编辑（现场侧所有权） ---------------- */
+
+  const updateDraftMeta = useCallback((field: 'name' | 'preparedAt', value: string) => {
+    mutateHandoff((handoff) => { handoff.draft[field] = value })
+  }, [mutateHandoff])
+
+  const addDraftEntry = useCallback(() => {
+    mutateHandoff((handoff) => {
+      handoff.draft.entries.push({
+        id: id('entry'), sceneNumber: '', revision: 'white', shootDate: new Date().toISOString().slice(0, 10),
+        characterIds: [], propIds: [], wardrobeChanges: [], notes: ''
+      })
+    })
+  }, [mutateHandoff])
+
+  const removeDraftEntry = useCallback((entryId: string) => {
+    mutateHandoff((handoff) => {
+      handoff.draft.entries = handoff.draft.entries.filter((entry) => entry.id !== entryId)
+    })
+  }, [mutateHandoff])
+
+  const updateDraftEntry = useCallback((entryId: string, field: keyof Pick<HandoffEntry, 'sceneNumber' | 'revision' | 'shootDate' | 'notes'>, value: string) => {
+    mutateHandoff((handoff) => {
+      const entry = handoff.draft.entries.find((item) => item.id === entryId)
+      if (entry) (entry as unknown as Record<string, string>)[field] = value
+    })
+  }, [mutateHandoff])
+
+  const toggleDraftEntryRef = useCallback((entryId: string, field: 'characterIds' | 'propIds', itemId: string) => {
+    mutateHandoff((handoff) => {
+      const entry = handoff.draft.entries.find((item) => item.id === entryId)
+      if (!entry) return
+      const values = entry[field]
+      entry[field] = values.includes(itemId) ? values.filter((value) => value !== itemId) : [...values, itemId]
+    })
+  }, [mutateHandoff])
+
+  const addDraftWardrobeChange = useCallback((entryId: string, characterId: string) => {
+    if (!characterId) return
+    mutateHandoff((handoff) => {
+      const entry = handoff.draft.entries.find((item) => item.id === entryId)
+      const wardrobe = stateRef.current.script.wardrobes.find((item) => item.characterId === characterId)
+      if (entry && !entry.wardrobeChanges.some((change) => change.characterId === characterId)) {
+        entry.wardrobeChanges.push({ id: id('wc'), characterId, wardrobeId: wardrobe?.id ?? '', note: '' })
+      }
+    })
+  }, [mutateHandoff])
+
+  const updateDraftWardrobeChange = useCallback((entryId: string, changeId: string, field: keyof WardrobeChange, value: string) => {
+    mutateHandoff((handoff) => {
+      const entry = handoff.draft.entries.find((item) => item.id === entryId)
+      const changeItem = entry?.wardrobeChanges.find((item) => item.id === changeId)
+      if (changeItem) (changeItem as unknown as Record<string, string>)[field] = value
+    })
+  }, [mutateHandoff])
+
+  const removeDraftWardrobeChange = useCallback((entryId: string, changeId: string) => {
+    mutateHandoff((handoff) => {
+      const entry = handoff.draft.entries.find((item) => item.id === entryId)
+      if (entry) entry.wardrobeChanges = entry.wardrobeChanges.filter((item) => item.id !== changeId)
+    })
+  }, [mutateHandoff])
+
+  /* ---------------- 发布：检查点 + 上一包留存 + 幂等重试 ---------------- */
+
+  const publishHandoff = useCallback(async (useLastPackage = false): Promise<void> => {
+    const current = stateRef.current.handoff
+    if (current.publish.phase === 'publishing') return
+
+    // 失败重试沿用冻结的包快照；成功后“重发上一包”用于验证幂等；否则冻结当前草稿为新包。
+    let pkg: HandoffPackage
+    let attempt: number
+    if (current.publish.phase === 'failed' && current.packages[0]?.id === current.publish.packageId) {
+      pkg = current.packages[0]
+      attempt = current.publish.attempt // 失败状态里已存的是下一次尝试序号
+    } else if (useLastPackage && current.lastPublishedPackage) {
+      pkg = current.lastPublishedPackage
+      attempt = current.publish.phase === 'success' ? current.publish.attempt : 1
+    } else {
+      pkg = {
+        ...clone(current.draft),
+        id: id('pkg'),
+        name: current.draft.name.trim() || '未命名交接包',
+        preparedAt: new Date().toISOString()
+      }
+      attempt = 1
+    }
+
+    const requestHash = packageRequestHash(pkg)
+    setState((previous) => ({
+      ...previous,
+      handoff: { ...previous.handoff, publish: { phase: 'publishing', packageId: pkg.id, requestHash, attempt, startedAt: new Date().toISOString() } }
+    }))
+
+    try {
+      const receipt = await publishPackage({ requestHash, packageName: pkg.name, attempt })
+      const logEntry = {
+        id: id('log'), requestHash, packageId: pkg.id, packageName: pkg.name, attempt,
+        status: 'success' as const, duplicate: receipt.duplicate,
+        detail: receipt.duplicate ? '服务端识别为同一包，未重复追加（幂等）' : '交接包已送达',
+        at: receipt.at
+      }
+      setState((previous) => ({
+        ...previous,
+        handoff: {
+          ...previous.handoff,
+          packages: previous.handoff.packages.some((item) => item.id === pkg.id) ? previous.handoff.packages : [pkg, ...previous.handoff.packages],
+          lastPublishedPackage: pkg,
+          publish: { phase: 'success', packageId: pkg.id, requestHash, attempt, duplicate: receipt.duplicate, at: receipt.at },
+          log: [logEntry, ...previous.handoff.log],
+          // 成功送达后关闭该包对应的失败检查点。
+          checkpoints: previous.handoff.checkpoints.map((cp) => cp.requestHash === requestHash ? { ...cp, resolvedAt: receipt.at } : cp)
+        }
+      }))
+    } catch (error) {
+      const failedAt = new Date().toISOString()
+      const reason = error instanceof Error ? error.message : '未知发布失败'
+      const nextAttempt = attempt + 1
+      const checkpointId = id('cp')
+      const logEntry = {
+        id: id('log'), requestHash, packageId: pkg.id, packageName: pkg.name, attempt,
+        status: 'failed' as const, duplicate: false, detail: reason, at: failedAt
+      }
+      setState((previous) => {
+        // 失败：冻结留存本包（不覆盖上一包之外的内容），并留下检查点；重试不产生新包。
+        const packages = previous.handoff.packages.some((item) => item.id === pkg.id) ? previous.handoff.packages : [pkg, ...previous.handoff.packages]
+        return {
+          ...previous,
+          handoff: {
+            ...previous.handoff,
+            packages,
+            lastPublishedPackage: previous.handoff.lastPublishedPackage ?? pkg,
+            publish: { phase: 'failed', packageId: pkg.id, requestHash, attempt: nextAttempt, checkpointId, reason, failedAt },
+            log: [logEntry, ...previous.handoff.log],
+            checkpoints: [
+              { id: checkpointId, packageId: pkg.id, packageName: pkg.name, requestHash, attempt, failedAt, reason },
+              ...previous.handoff.checkpoints
+            ]
+          }
+        }
+      })
+    }
+  }, [])
+
+  /* ---------------- 导入：按场号+修订色归位，冲突进待裁决，绝不改正文 ---------------- */
+
+  const importLastPackage = useCallback((): ImportSummary => {
+    const handoff = stateRef.current.handoff
+    const source = handoff.lastPublishedPackage ?? handoff.packages[0]
+    if (!source) return { attached: 0, conflicts: 0, skipped: 0 }
+    const plan = planImport(source, stateRef.current.script, handoff.importedEntryIds)
+
+    const attached: Array<{ record: AttachedHandoff; sceneId: string }> = []
+    const conflicts: ArbitrationRecord[] = []
+    const imported: string[] = []
+    let skipped = 0
+    const now = new Date().toISOString()
+
+    source.entries.forEach((entry, index) => {
+      const item = plan.items[index]
+      if (item.kind === 'skip') { skipped += 1; return }
+      if (item.kind === 'conflict') {
+        conflicts.push({
+          id: id('arb'),
+          packageId: source.id,
+          packageName: source.name,
+          entryId: entry.id,
+          sceneNumber: entry.sceneNumber,
+          revision: entry.revision,
+          shootDate: entry.shootDate,
+          characterIds: [...entry.characterIds],
+          propIds: [...entry.propIds],
+          wardrobeChanges: clone(entry.wardrobeChanges),
+          notes: entry.notes,
+          reason: item.reason,
+          candidateSceneIds: item.candidateSceneIds,
+          localRevision: item.localRevision,
+          createdAt: now,
+          status: 'pending'
+        })
+        return
+      }
+      attached.push({
+        sceneId: item.sceneId,
+        record: {
+          id: id('att'),
+          packageId: source.id,
+          packageName: source.name,
+          entryId: entry.id,
+          shootDate: entry.shootDate,
+          revision: entry.revision,
+          characterIds: [...entry.characterIds],
+          propIds: [...entry.propIds],
+          wardrobeChanges: clone(entry.wardrobeChanges),
+          notes: entry.notes,
+          attachedAt: now,
+          viaArbitration: false
+        }
+      })
+      imported.push(entry.id)
+    })
+
+    mutateHandoff((next) => {
+      attached.forEach(({ record, sceneId }) => {
+        const list = next.attached[sceneId] ?? []
+        if (!list.some((item) => item.entryId === record.entryId)) list.push(record)
+        next.attached[sceneId] = list
+      })
+      conflicts.forEach((record) => {
+        if (!next.arbitration.some((item) => item.entryId === record.entryId && item.status === 'pending')) {
+          next.arbitration.unshift(record)
+        }
+      })
+      imported.forEach((entryId) => { if (!next.importedEntryIds.includes(entryId)) next.importedEntryIds.push(entryId) })
+    })
+
+    return { attached: attached.length, conflicts: conflicts.length, skipped }
+  }, [mutateHandoff])
+
+  const resolveArbitration = useCallback((recordId: string, action: { kind: 'discard' } | { kind: 'attach'; sceneId: string }): boolean => {
+    const record = stateRef.current.handoff.arbitration.find((item) => item.id === recordId)
+    if (!record || record.status !== 'pending') return false
+    const now = new Date().toISOString()
+    if (action.kind === 'discard') {
+      mutateHandoff((next) => {
+        const target = next.arbitration.find((item) => item.id === recordId)
+        if (target) { target.status = 'discarded'; target.resolvedAt = now }
+      })
+      return true
+    }
+    const scene = stateRef.current.script.scenes.find((item) => item.id === action.sceneId)
+    if (!scene) return false
+    const attached: AttachedHandoff = {
+      id: id('att'),
+      packageId: record.packageId,
+      packageName: record.packageName,
+      entryId: record.entryId,
+      shootDate: record.shootDate,
+      revision: record.revision,
+      characterIds: [...record.characterIds],
+      propIds: [...record.propIds],
+      wardrobeChanges: clone(record.wardrobeChanges),
+      notes: record.notes,
+      attachedAt: now,
+      viaArbitration: true
+    }
+    mutateHandoff((next) => {
+      const list = next.attached[action.sceneId] ?? []
+      if (!list.some((item) => item.entryId === attached.entryId)) list.push(attached)
+      next.attached[action.sceneId] = list
+      if (!next.importedEntryIds.includes(record.entryId)) next.importedEntryIds.push(record.entryId)
+      const target = next.arbitration.find((item) => item.id === recordId)
+      if (target) { target.status = 'attached'; target.resolvedSceneId = action.sceneId; target.resolvedAt = now }
+    })
+    return true
+  }, [mutateHandoff])
 
   return {
     state,
@@ -329,6 +701,7 @@ export function useContinuityStore() {
     warnings: deriveWarnings(state.script),
     updateScriptField,
     updateScene,
+    setSceneStatus,
     toggleSceneRelation,
     setCostume,
     moveScene,
@@ -346,6 +719,19 @@ export function useContinuityStore() {
     restoreVersion,
     undo,
     redo,
-    reset
+    reset,
+    updateDraftMeta,
+    addDraftEntry,
+    removeDraftEntry,
+    updateDraftEntry,
+    toggleDraftEntryRef,
+    addDraftWardrobeChange,
+    updateDraftWardrobeChange,
+    removeDraftWardrobeChange,
+    publishHandoff,
+    importLastPackage,
+    resolveArbitration
   }
 }
+
+export type ContinuityStore = ReturnType<typeof useContinuityStore>
